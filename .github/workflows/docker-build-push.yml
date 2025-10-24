@@ -82,7 +82,11 @@ jobs:
               "docker pull ${{ secrets.DOCKERHUB_USERNAME }}/cs6620-app:latest",
               "docker stop cs6620-app || true",
               "docker rm -f cs6620-app || true",
-              "docker run -d --name cs6620-app -p 80:5000 --restart unless-stopped ${{ secrets.DOCKERHUB_USERNAME }}/cs6620-app:latest",
+              "docker run -d --name cs6620-app -p 80:5000 --restart unless-stopped
+                -e APP_VERSION=2.0 \
+                -e DEPLOY_METHOD='\''GitHub Actions + AWS SSM'\'' \
+                -e BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+                ${{ secrets.DOCKERHUB_USERNAME }}/cs6620-app:latest",
               "docker ps --format \\"{{.Names}}\\t{{.Image}}\\t{{.Status}}\\"",
               "echo === Deploy finished on $(date -u) ==="
             ]' \
