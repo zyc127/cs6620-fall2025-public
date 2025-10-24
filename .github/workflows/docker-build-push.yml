@@ -1,18 +1,23 @@
-name: Build & Push to Docker Hub
+name: Docker Build, Push, and Deploy
 
 on:
   push:
-    branches: [ "week02" ]
+    branches: ["week02"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   docker:
+    name: Build & Push to Docker Hub
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-
     steps:
       - name: Check out code
         uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -23,12 +28,17 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Short SHA
+      - name: Extract metadata (tags, labels)
         id: meta
-        run: echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/cs6620-app
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short,prefix=,suffix=
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+      - name: Build and push
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
@@ -36,7 +46,7 @@ jobs:
           platforms: linux/amd64
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/cs6620-app:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/cs6620-app:${{ steps.meta.outputs.SHORT_SHA }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/cs6620-app:${{ steps.meta.outputs.tags }}
           labels: |
             org.opencontainers.image.source=${{ github.event.repository.html_url }}
             org.opencontainers.image.revision=${{ github.sha }}
@@ -44,3 +54,62 @@ jobs:
             build.workflow=${{ github.workflow }}
             build.run_id=${{ github.run_id }}
             build.run_number=${{ github.run_number }}
+
+  deploy:
+    name: Deploy to EC2 via SSM
+    needs: docker
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Determine image
+        id: img
+        run: |
+          echo "IMAGE=${{ secrets.DOCKERHUB_USERNAME }}/cs6620-app:latest" >> $GITHUB_OUTPUT
+
+      - name: Send SSM deploy command
+        id: ssm_send
+        run: |
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "CI/CD deploy: pull & restart cs6620-app on port 80 (via GitHub Actions + SSM)" \
+            --parameters commands='[
+              "set -e",
+              "echo === Deploy started on $(date -u) ===",
+              "docker pull ${{ secrets.DOCKERHUB_USERNAME }}/cs6620-app:latest",
+              "docker stop cs6620-app || true",
+              "docker rm -f cs6620-app || true",
+              "docker run -d --name cs6620-app -p 80:5000 --restart unless-stopped ${{ secrets.DOCKERHUB_USERNAME }}/cs6620-app:latest",
+              "docker ps --format \\"{{.Names}}\\t{{.Image}}\\t{{.Status}}\\"",
+              "echo === Deploy finished on $(date -u) ==="
+            ]' \
+            --query "Command.CommandId" --output text)
+          echo "command_id=$CMD_ID" >> $GITHUB_OUTPUT
+          echo "Sent SSM command: $CMD_ID"
+
+      - name: Wait for command to finish and print output
+        run: |
+          INSTANCE="${{ secrets.EC2_INSTANCE_ID }}"
+          CMD_ID="${{ steps.ssm_send.outputs.command_id }}"
+          echo "Waiting for SSM command $CMD_ID on $INSTANCE ..."
+          for i in {1..40}; do
+            STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE" --query "Status" --output text || true)
+            echo "Status: $STATUS"
+            if [ "$STATUS" = "Success" ] || [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
+              break
+            fi
+            sleep 6
+          done
+          echo "=== STDOUT ==="
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE" --query "StandardOutputContent" --output text || true
+          echo "=== STDERR ==="
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE" --query "StandardErrorContent" --output text || true
+          test "$STATUS" = "Success"
+
