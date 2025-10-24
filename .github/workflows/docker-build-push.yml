@@ -36,16 +36,19 @@ jobs:
             type=raw,value=latest
             type=sha,format=short,prefix=,suffix=
 
-      - name: Build and push
+      - name: Build and push (multi-arch)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           push: true
-          platforms: linux/amd64
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/cs6620-app:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/cs6620-app:${{ github.sha }}
           labels: |
-            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=${{ github.event.repository.html_url }}
+            org.opencontainers.image.revision=${{ github.sha }}
             build.source=github-actions
             build.workflow=${{ github.workflow }}
             build.run_id=${{ github.run_id }}
